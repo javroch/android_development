@@ -101,7 +101,7 @@ void FrameBuffer::finalize(){
     }
 }
 
-bool FrameBuffer::initialize(int width, int height)
+bool FrameBuffer::initialize(int width, int height, OnPostFn onPost, void* onPostContext)
 {
     if (s_theFrameBuffer != NULL) {
         return true;
@@ -110,7 +110,7 @@ bool FrameBuffer::initialize(int width, int height)
     //
     // allocate space for the FrameBuffer object
     //
-    FrameBuffer *fb = new FrameBuffer(width, height);
+    FrameBuffer *fb = new FrameBuffer(width, height, onPost, onPostContext);
     if (!fb) {
         ERR("Failed to create fb\n");
         return false;
@@ -334,6 +334,17 @@ bool FrameBuffer::initialize(int width, int height)
     //
     fb->initGLState();
 
+    //
+    // Allocate space for the onPost framebuffer image
+    //
+    if (onPost) {
+        fb->m_fbImage = (unsigned char*)malloc(4 * width * height);
+        if (!fb->m_fbImage) {
+            delete fb;
+            return false;
+        }
+    }
+
     // release the FB context
     fb->unbind_locked();
 
@@ -344,7 +355,8 @@ bool FrameBuffer::initialize(int width, int height)
     return true;
 }
 
-FrameBuffer::FrameBuffer(int p_width, int p_height) :
+FrameBuffer::FrameBuffer(int p_width, int p_height,
+        OnPostFn onPost, void* onPostContext) :
     m_width(p_width),
     m_height(p_height),
     m_eglDisplay(EGL_NO_DISPLAY),
@@ -360,13 +372,17 @@ FrameBuffer::FrameBuffer(int p_width, int p_height) :
     m_zRot(0.0f),
     m_eglContextInitialized(false),
     m_statsNumFrames(0),
-    m_statsStartTime(0LL)
+    m_statsStartTime(0LL),
+    m_onPost(onPost),
+    m_onPostContext(onPostContext),
+    m_fbImage(NULL)
 {
     m_fpsStats = getenv("SHOW_FPS_STATS") != NULL;
 }
 
 FrameBuffer::~FrameBuffer()
 {
+    free(m_fbImage);
 }
 
 bool FrameBuffer::setupSubWindow(FBNativeWindowType p_window,
@@ -458,7 +474,8 @@ HandleType FrameBuffer::createColorBuffer(int p_width, int p_height,
     ColorBufferPtr cb( ColorBuffer::create(p_width, p_height, p_internalFormat) );
     if (cb.Ptr() != NULL) {
         ret = genHandle();
-        m_colorbuffers[ret] = cb;
+        m_colorbuffers[ret].cb = cb;
+        m_colorbuffers[ret].refcount = 1;
     }
     return ret;
 }
@@ -512,10 +529,28 @@ void FrameBuffer::DestroyWindowSurface(HandleType p_surface)
     m_windows.erase(p_surface);
 }
 
-void FrameBuffer::DestroyColorBuffer(HandleType p_colorbuffer)
+void FrameBuffer::openColorBuffer(HandleType p_colorbuffer)
 {
     android::Mutex::Autolock mutex(m_lock);
-    m_colorbuffers.erase(p_colorbuffer);
+    ColorBufferMap::iterator c(m_colorbuffers.find(p_colorbuffer));
+    if (c == m_colorbuffers.end()) {
+        // bad colorbuffer handle
+        return;
+    }
+    (*c).second.refcount++;
+}
+
+void FrameBuffer::closeColorBuffer(HandleType p_colorbuffer)
+{
+    android::Mutex::Autolock mutex(m_lock);
+    ColorBufferMap::iterator c(m_colorbuffers.find(p_colorbuffer));
+    if (c == m_colorbuffers.end()) {
+        // bad colorbuffer handle
+        return;
+    }
+    if (--(*c).second.refcount == 0) {
+        m_colorbuffers.erase(c);
+    }
 }
 
 bool FrameBuffer::flushWindowSurfaceColorBuffer(HandleType p_surface)
@@ -550,7 +585,7 @@ bool FrameBuffer::setWindowSurfaceColorBuffer(HandleType p_surface,
         return false;
     }
 
-    (*w).second->setColorBuffer( (*c).second );
+    (*w).second->setColorBuffer( (*c).second.cb );
 
     return true;
 }
@@ -567,7 +602,7 @@ bool FrameBuffer::updateColorBuffer(HandleType p_colorbuffer,
         return false;
     }
 
-    (*c).second->subUpdate(x, y, width, height, format, type, pixels);
+    (*c).second.cb->subUpdate(x, y, width, height, format, type, pixels);
 
     return true;
 }
@@ -582,7 +617,7 @@ bool FrameBuffer::bindColorBufferToTexture(HandleType p_colorbuffer)
         return false;
     }
 
-    return (*c).second->bindToTexture();
+    return (*c).second.cb->bindToTexture();
 }
 
 bool FrameBuffer::bindColorBufferToRenderbuffer(HandleType p_colorbuffer)
@@ -595,7 +630,7 @@ bool FrameBuffer::bindColorBufferToRenderbuffer(HandleType p_colorbuffer)
         return false;
     }
 
-    return (*c).second->bindToRenderbuffer();
+    return (*c).second.cb->bindToRenderbuffer();
 }
 
 bool FrameBuffer::bindContext(HandleType p_context,
@@ -776,10 +811,19 @@ bool FrameBuffer::post(HandleType p_colorbuffer, bool needLock)
         if (m_zRot != 0.0f) {
             s_gl.glClear(GL_COLOR_BUFFER_BIT);
         }
-        ret = (*c).second->post();
+        ret = (*c).second.cb->post();
         s_gl.glPopMatrix();
 
         if (ret) {
+            //
+            // Send framebuffer (without FPS overlay) to callback
+            //
+            if (m_onPost) {
+                s_gl.glReadPixels(0, 0, m_width, m_height,
+                        GL_RGBA, GL_UNSIGNED_BYTE, m_fbImage);
+                m_onPost(m_onPostContext, m_width, m_height, -1,
+                        GL_RGBA, GL_UNSIGNED_BYTE, m_fbImage);
+            }
 
             //
             // output FPS statistics
